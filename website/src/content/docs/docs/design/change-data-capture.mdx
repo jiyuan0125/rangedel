@@ -1,0 +1,102 @@
+---
+title: Change Data Capture
+description: Stream SlateDB WAL files with a live SlateDbWalReader iterator
+---
+
+import { Code } from '@astrojs/starlight/components';
+import cdcExample from '/../examples/src/change_data_capture.rs?raw';
+
+Change data capture (CDC) turns writes in SlateDB into a durable change stream that external systems can consume. SlateDB exposes native-WAL CDC through **slatedb::wal::SlateDbWalReader**.
+
+The reader opens a live iterator from the first unconsumed WAL file ID. The iterator owns polling and waits internally when it reaches the current WAL tail; the caller owns durable cursor storage.
+
+## When to use WAL-based CDC
+
+Use WAL-based CDC when you need:
+
+- A low-latency stream of inserts, updates, and deletes.
+- A durable append-only feed that can be replayed.
+- Integration with downstream systems such as Kafka, Pulsar, or data lakes.
+
+WAL-based CDC is not a bootstrap or backfill API. Combine a database backfill with WAL streaming when an initial full copy is required.
+
+## Streaming model
+
+Keep a durable cursor containing the last fully consumed WAL file ID. Use zero when starting from the beginning unless you have a more appropriate manifest-derived cursor.
+
+To consume the stream:
+
+1. Compute **cursor + 1**, checking for overflow, and create one iterator with an unbounded end range beginning at that WAL file ID.
+2. Repeatedly call **next()**. When the iterator reaches the current tail, the call waits and polls internally for the next WAL file.
+3. Emit every row in each **WalRows** batch.
+4. After the whole batch succeeds, persist its **last_consumed_wal_file_id** as the new cursor.
+5. After a restart, create a new unbounded iterator beginning at the persisted cursor plus one.
+
+The live iterator does not report exhaustion at the current tail; **next()** remains pending until a new WAL file is visible or an error occurs. **last_wal_file_id** remains available when an application needs a point-in-time tail snapshot, but it is not part of the streaming loop.
+
+## Batches and cursor progress
+
+One **WalRows** batch represents one fully consumed WAL file and contains:
+
+- **rows**: the file's row entries, in sequence order
+- **last_consumed_wal_file_id**: the durable cursor after that file
+
+Empty fence WAL files produce a batch with no rows. The cursor still advances, so consumers must process the batch rather than flattening batches into rows and losing progress information.
+
+Each row is a **RowEntry** with:
+
+- **key**: key bytes
+- **value**: a **ValueDeletable** value, merge operand, or tombstone
+- **seq**: the globally increasing sequence number
+- **create_ts** and **expire_ts**: optional timestamps
+
+Deletes appear as tombstones. Merge operands remain raw merge values; downstream consumers must apply the merge logic themselves when materialized values are required.
+
+## Visibility and durability
+
+SlateDbWalReader only sees WAL SSTs flushed to object storage. WAL flushes occur when:
+
+- The WAL buffer reaches its size threshold.
+- The configured flush interval elapses.
+- The caller explicitly requests a WAL or memtable flush.
+
+A memtable flush first forces pending WAL data to durable storage.
+
+The database must have its WAL enabled. WAL support is enabled by default.
+
+## Basic live stream
+
+This example creates one unbounded iterator, emits both existing and later writes through it, and advances a durable file cursor.
+
+<Code code={cdcExample} lang="rust" title="main.rs" />
+
+Persisting the cursor only after a complete batch gives at-least-once delivery if a process fails while emitting that WAL file. Make the sink idempotent or transactionally couple sink writes with cursor persistence when duplicates are unacceptable.
+
+## Ordering and resumability
+
+WAL file IDs increase monotonically, and entries within each file are returned in sequence order. The minimal cursor is therefore the last fully consumed WAL file ID.
+
+Do not advance the cursor per row. Doing so can lose progress for empty fence WALs and can incorrectly mark a partially emitted WAL file as complete.
+
+If a requested file has already been garbage collected, iteration reports a truncation/data error. The consumer must not silently skip the gap.
+
+## Backfills plus streaming
+
+For a full backfill:
+
+1. Begin live WAL streaming and buffer changes.
+2. Create a detached database checkpoint.
+3. Scan the checkpoint or a clone for existing data.
+4. Apply buffered WAL changes in sequence order.
+5. Delete the checkpoint.
+6. Continue streaming from the persisted WAL cursor.
+
+The sink should tolerate overlap between the backfill and WAL stream.
+
+## WAL retention and GC
+
+WAL SSTs are garbage collected according to the configured retention policy. Set WAL GC minimum age long enough for the slowest consumer and monitor cursor lag. A consumer that requests a deleted WAL receives a truncation error instead of silently continuing.
+
+## Dedicated WAL object stores
+
+When a database uses a dedicated WAL object store, construct the reader with both stores: the main object store is used for manifest and GC-cutoff state, and the dedicated WAL object store is used for WAL SSTs. In Rust, use **SlateDbWalReader::new_for_db_with_wal_object_store**.
