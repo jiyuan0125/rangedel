@@ -299,6 +299,21 @@ impl BytesRange {
         self.inner.comparable_end_bound()
     }
 
+    pub(crate) fn bound_key_len(bound: Bound<&Bytes>) -> usize {
+        match bound {
+            Included(k) | Excluded(k) => k.len(),
+            Unbounded => 0,
+        }
+    }
+
+    pub(crate) fn start_bytes_len(&self) -> usize {
+        Self::bound_key_len(RangeBounds::start_bound(self))
+    }
+
+    pub(crate) fn end_bytes_len(&self) -> usize {
+        Self::bound_key_len(RangeBounds::end_bound(self))
+    }
+
     pub(crate) fn as_point(&self) -> Option<&Bytes> {
         match (RangeBounds::start_bound(self), RangeBounds::end_bound(self)) {
             (Included(start), Included(end)) if start == end => Some(start),

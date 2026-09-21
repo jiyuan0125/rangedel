@@ -334,6 +334,8 @@ pub(crate) struct EncodedSsTableFooterBuilder<'a, 'b> {
     sst_format_version: u16,
     /// type of SST (Compacted or Wal)
     sst_type: SstType,
+    /// Encoded range tombstone side block payload.
+    range_tombstones: Option<Bytes>,
 }
 
 impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
@@ -360,7 +362,13 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
             stats: None,
             sst_format_version,
             sst_type,
+            range_tombstones: None,
         }
+    }
+
+    pub(crate) fn with_range_tombstones(mut self, range_tombstones: Option<Bytes>) -> Self {
+        self.range_tombstones = range_tombstones;
+        self
     }
 
     /// Sets an optional compression codec to the footer.
@@ -456,6 +464,23 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
             None => (0u64, 0u64),
         };
 
+        // Write range tombstones side block after stats, using the same
+        // compression/transform/checksum path.
+        let (range_tombstones_offset, range_tombstones_len) = match self.range_tombstones.take() {
+            Some(payload) if !payload.is_empty() => {
+                let offset = self.blocks_size + buf.len() as u64;
+                let len = compress_and_transform(
+                    &mut buf,
+                    payload,
+                    self.compression_codec,
+                    self.block_transformer.as_ref(),
+                )
+                .await? as u64;
+                (offset, len)
+            }
+            _ => (0u64, 0u64),
+        };
+
         let meta_offset = self.blocks_size + buf.len() as u64;
         let filter_format = FilterFormat::Composite;
         let info = SsTableInfo {
@@ -470,6 +495,8 @@ impl<'a, 'b> EncodedSsTableFooterBuilder<'a, 'b> {
             stats_offset,
             stats_len,
             filter_format,
+            range_tombstones_offset,
+            range_tombstones_len,
         };
         SsTableInfo::encode(&info, &mut buf, self.sst_info_codec);
 
@@ -878,6 +905,32 @@ impl SsTableFormat {
             None => untransformed_bytes,
         };
         SstStats::decode(decompressed_bytes)
+    }
+
+    pub(crate) async fn read_range_tombstones(
+        &self,
+        info: &SsTableInfo,
+        obj: &impl ReadOnlyBlob,
+    ) -> Result<Vec<crate::range_tombstone::RangeTombstone>, SlateDBError> {
+        if info.range_tombstones_len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = info.range_tombstones_offset + info.range_tombstones_len;
+        let bytes = obj.read_range(info.range_tombstones_offset..end).await?;
+        let bytes = self.validate_checksum(bytes)?;
+        let untransformed = match &self.block_transformer {
+            Some(t) => t
+                .decode(bytes)
+                .await
+                .map_err(|_| SlateDBError::BlockTransformError)?,
+            None => bytes,
+        };
+        let decompressed = match info.compression_codec {
+            Some(c) => Self::decompress(untransformed, c)?,
+            None => untransformed,
+        };
+        crate::range_tombstone::decode_range_tombstones(decompressed)
+            .map_err(|_| SlateDBError::InvalidDBState)
     }
 
     /// Decompresses the compressed data using the specified compression codec.

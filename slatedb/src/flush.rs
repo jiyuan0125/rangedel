@@ -98,6 +98,7 @@ impl DbInner {
         sst_id: SsTableId,
     ) -> Result<Option<(SsTableHandle, u64)>, SlateDBError> {
         let mut writer = self.table_store.table_writer(sst_id, Some(Bytes::new()));
+        let range_tombstones = imm_table.range_tombstones();
         let mut iter = match self.iter_imm_table(imm_table, min_retention_seq).await {
             Ok(iter) => iter,
             Err(e) => {
@@ -123,7 +124,13 @@ impl DbInner {
                 }
             }
         }
-        if !any {
+        // Range tombstones are not point rows, so they reach the SST through
+        // the side block path. They make an otherwise empty memtable flushable
+        // so a range-only write is not lost when the WAL gets trimmed.
+        for tombstone in range_tombstones {
+            writer.add_range_tombstone(tombstone);
+        }
+        if !any && !writer.has_range_tombstones() {
             return Ok(None);
         }
         Ok(Some(writer.close().await?))
@@ -147,6 +154,7 @@ impl DbInner {
         min_retention_seq: Option<u64>,
         segment_sst_ids: &BTreeMap<Bytes, Ulid>,
     ) -> Result<Vec<SegmentedSstHandle>, SlateDBError> {
+        let range_tombstones = imm_table.range_tombstones();
         let mut entries = self.iter_imm_table(imm_table, min_retention_seq).await?;
         let mut seg_iter = touched_segments.into_iter();
         let mut current_prefix = seg_iter
@@ -175,6 +183,9 @@ impl DbInner {
             // to the next prefix.
             while !entry.key.starts_with(current_prefix.as_ref()) {
                 if current_has_entry {
+                    for tombstone in &range_tombstones {
+                        current_writer.add_range_tombstone(tombstone.clone());
+                    }
                     let (sst_handle, encoded_bytes) = current_writer.close().await?;
                     out.push(SegmentedSstHandle {
                         prefix: current_prefix,
@@ -203,6 +214,9 @@ impl DbInner {
             tokio::task::coop::consume_budget().await;
         }
         if current_has_entry {
+            for tombstone in &range_tombstones {
+                current_writer.add_range_tombstone(tombstone.clone());
+            }
             let (sst_handle, encoded_bytes) = current_writer.close().await?;
             out.push(SegmentedSstHandle {
                 prefix: current_prefix,

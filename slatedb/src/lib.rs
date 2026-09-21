@@ -154,6 +154,8 @@ mod paths;
 mod peeking_iterator;
 #[cfg(test)]
 mod proptest_util;
+mod range_tombstone;
+mod range_tombstone_iter;
 mod reader;
 mod retention_iterator;
 mod retrying_object_store;

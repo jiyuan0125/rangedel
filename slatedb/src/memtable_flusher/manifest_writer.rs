@@ -527,12 +527,18 @@ impl ManifestWriterHandler {
                 core.replay_after_wal_id = uploaded.imm_memtable.recent_flushed_wal_id();
 
                 let memtable_tick = uploaded.imm_memtable.table().last_tick();
-                core.last_l0_clock_tick = cmp::max(core.last_l0_clock_tick, memtable_tick);
-                if core.last_l0_clock_tick != memtable_tick {
-                    return Err(SlateDBError::InvalidClockTick {
-                        last_tick: core.last_l0_clock_tick,
-                        next_tick: memtable_tick,
-                    });
+                // A memtable that only carries range tombstones has no TTL
+                // timestamped rows, so its tick stays at i64::MIN. It must not
+                // move the L0 clock watermark backwards or trip the monotonic
+                // tick check; just retain the existing watermark.
+                if memtable_tick != i64::MIN {
+                    core.last_l0_clock_tick = cmp::max(core.last_l0_clock_tick, memtable_tick);
+                    if core.last_l0_clock_tick != memtable_tick {
+                        return Err(SlateDBError::InvalidClockTick {
+                            last_tick: core.last_l0_clock_tick,
+                            next_tick: memtable_tick,
+                        });
+                    }
                 }
 
                 // The same sequence number can't span multiple L0' SSTs--only SSTs in SRs

@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::ops::Bound;
 
 /// Represents a key-value pair known not to be a tombstone.
 #[non_exhaustive]
@@ -16,7 +17,8 @@ pub struct KeyValue {
 /// This is the entry type passed to compaction for each key value pair.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowEntry {
-    /// The key bytes.
+    /// The key bytes. For a range tombstone (`end_bound` is `Some`), this is
+    /// the interval start marker and never a user key.
     pub key: Bytes,
     /// The value, which may be a regular value, merge operand, or tombstone.
     pub value: ValueDeletable,
@@ -26,6 +28,14 @@ pub struct RowEntry {
     pub create_ts: Option<i64>,
     /// The expiration timestamp (if set).
     pub expire_ts: Option<i64>,
+    /// When `Some`, this entry is a range tombstone and the pair
+    /// (`key`, `end_bound`) is its interval. `key` is the included start key
+    /// when `start_inclusive` is true, otherwise it is the excluded start.
+    /// An unbounded start is the empty key with `start_inclusive == false`.
+    pub end_bound: Option<Bound<Bytes>>,
+    /// Whether the interval start is inclusive. Only meaningful when
+    /// `end_bound` is `Some`.
+    pub start_inclusive: bool,
 }
 
 impl RowEntry {
@@ -42,11 +52,20 @@ impl RowEntry {
             seq,
             create_ts,
             expire_ts,
+            end_bound: None,
+            start_inclusive: false,
         }
     }
 
     pub(crate) fn estimated_size(&self) -> usize {
         let mut size = self.key.len() + self.value.len();
+        if let Some(end) = &self.end_bound {
+            // start_flag + end_flag + u32 end_len + end key (row payload)
+            size += 1 + 1 + 4;
+            if let Bound::Included(k) | Bound::Excluded(k) = end {
+                size += k.len();
+            }
+        }
         // Add size for sequence number
         size += size_of::<u64>();
         // Add size for timestamps
@@ -84,35 +103,35 @@ impl RowEntry {
 
     #[cfg(test)]
     pub(crate) fn new_value(key: &[u8], value: &[u8], seq: u64) -> Self {
-        Self {
-            key: Bytes::copy_from_slice(key),
-            value: ValueDeletable::Value(Bytes::copy_from_slice(value)),
+        Self::new(
+            Bytes::copy_from_slice(key),
+            ValueDeletable::Value(Bytes::copy_from_slice(value)),
             seq,
-            create_ts: None,
-            expire_ts: None,
-        }
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn new_merge(key: &[u8], value: &[u8], seq: u64) -> Self {
-        Self {
-            key: Bytes::copy_from_slice(key),
-            value: ValueDeletable::Merge(Bytes::copy_from_slice(value)),
+        Self::new(
+            Bytes::copy_from_slice(key),
+            ValueDeletable::Merge(Bytes::copy_from_slice(value)),
             seq,
-            create_ts: None,
-            expire_ts: None,
-        }
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn new_tombstone(key: &[u8], seq: u64) -> Self {
-        Self {
-            key: Bytes::copy_from_slice(key),
-            value: ValueDeletable::Tombstone,
+        Self::new(
+            Bytes::copy_from_slice(key),
+            ValueDeletable::Tombstone,
             seq,
-            create_ts: None,
-            expire_ts: None,
-        }
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -123,6 +142,8 @@ impl RowEntry {
             seq: self.seq,
             create_ts: Some(create_ts),
             expire_ts: self.expire_ts,
+            end_bound: self.end_bound.clone(),
+            start_inclusive: self.start_inclusive,
         }
     }
 
@@ -134,6 +155,51 @@ impl RowEntry {
             seq: self.seq,
             create_ts: self.create_ts,
             expire_ts: Some(expire_ts),
+            end_bound: self.end_bound.clone(),
+            start_inclusive: self.start_inclusive,
+        }
+    }
+
+    /// True when this entry is a range tombstone rather than a point row.
+    pub(crate) fn is_range_tombstone(&self) -> bool {
+        self.end_bound.is_some()
+    }
+
+    pub(crate) fn new_range_tombstone(
+        key: Bytes,
+        start_inclusive: bool,
+        end_bound: Bound<Bytes>,
+        seq: u64,
+        create_ts: Option<i64>,
+    ) -> Self {
+        Self {
+            key,
+            value: ValueDeletable::Tombstone,
+            seq,
+            create_ts,
+            expire_ts: None,
+            end_bound: Some(end_bound),
+            start_inclusive,
+        }
+    }
+
+    pub(crate) fn with_range_fields(
+        key: Bytes,
+        value: ValueDeletable,
+        seq: u64,
+        create_ts: Option<i64>,
+        expire_ts: Option<i64>,
+        end_bound: Option<Bound<Bytes>>,
+        start_inclusive: bool,
+    ) -> Self {
+        Self {
+            key,
+            value,
+            seq,
+            create_ts,
+            expire_ts,
+            end_bound,
+            start_inclusive,
         }
     }
 }

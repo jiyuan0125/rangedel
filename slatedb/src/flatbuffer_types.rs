@@ -159,6 +159,8 @@ impl FlatBufferSsTableInfoCodec {
             stats_offset: info.stats_offset(),
             stats_len: info.stats_len(),
             filter_format: info.filter_format().into(),
+            range_tombstones_offset: info.range_tombstones_offset(),
+            range_tombstones_len: info.range_tombstones_len(),
         }
     }
 
@@ -798,6 +800,8 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 stats_offset: info.stats_offset,
                 stats_len: info.stats_len,
                 filter_format: info.filter_format.into(),
+                range_tombstones_offset: info.range_tombstones_offset,
+                range_tombstones_len: info.range_tombstones_len,
             },
         )
     }

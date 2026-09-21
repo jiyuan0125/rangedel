@@ -284,7 +284,7 @@ impl DbInner {
         self.db_stats.write_batch_count.increment(1);
         self.db_stats.write_ops.increment(batch.op_count() as u64);
         self.check_closed()?;
-        if batch.ops.is_empty() {
+        if batch.is_empty() {
             return Err(SlateDBError::EmptyBatch);
         }
 
@@ -1515,6 +1515,64 @@ impl Db {
         self.write_with_options(batch, options).await
     }
 
+    /// Delete every key in a key range with default `WriteOptions`.
+    ///
+    /// The range uses the exact same bound expressions as [`Db::scan`]:
+    /// `"k2".."k5"` is half open (`k2` included, `k5` excluded),
+    /// `"k2"..="k4"` includes both endpoints, and `a..` / `..=b` / `..`
+    /// express unbounded sides. The deletion is recorded as one range
+    /// tombstone, so its WAL, memtable and object-storage cost does not grow
+    /// with the number of keys in the interval.
+    ///
+    /// Only data written before the deletion is hidden. A later
+    /// [`Db::put`] into the interval remains visible. Keys outside the
+    /// interval are never affected.
+    ///
+    /// This method returns after updating the in-memory WAL and MemTable. It
+    /// does not wait for the delete to become durable in object storage. Call
+    /// [`WriteHandle::await_durable`] on the returned handle to wait for this
+    /// delete, or [`Db::flush`] to flush all pending writes.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use slatedb::{Db, Error};
+    /// use slatedb::object_store::{ObjectStore, memory::InMemory};
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Error> {
+    ///     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    ///     let db = Db::open("test_db", object_store).await?;
+    ///     let handle = db.delete_range("k2".."k5").await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn delete_range<T>(&self, range: T) -> Result<WriteHandle, crate::Error>
+    where
+        T: ByteRangeBounds + Send,
+    {
+        self.delete_range_with_options(range, &WriteOptions::default())
+            .await
+    }
+
+    /// Delete every key in a key range with custom `WriteOptions`.
+    ///
+    /// See [`Db::delete_range`] for the range semantics and durability
+    /// behavior.
+    pub async fn delete_range_with_options<T>(
+        &self,
+        range: T,
+        options: &WriteOptions,
+    ) -> Result<WriteHandle, crate::Error>
+    where
+        T: ByteRangeBounds + Send,
+    {
+        let mut batch = WriteBatch::new();
+        batch.delete_range(range);
+        self.write_with_options(batch, options).await
+    }
+
     /// Merge a value into the database with default `MergeOptions` and `WriteOptions`.
     ///
     /// This method returns after updating the in-memory WAL and MemTable. It
@@ -1987,6 +2045,17 @@ impl DbWriteOps for Db {
         options: &WriteOptions,
     ) -> Result<WriteHandle, crate::Error> {
         Db::delete_with_options(self, key, options).await
+    }
+
+    async fn delete_range_with_options<T>(
+        &self,
+        range: T,
+        options: &WriteOptions,
+    ) -> Result<WriteHandle, crate::Error>
+    where
+        T: ByteRangeBounds + Send,
+    {
+        Db::delete_range_with_options(self, range, options).await
     }
 
     async fn merge_with_options<K, V>(
@@ -5811,6 +5880,114 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_range_delete_coexists_with_merge_operator() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_range_delete_merge";
+        let db = Db::builder(path, object_store)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator {}))
+            .build()
+            .await
+            .unwrap();
+
+        db.put(b"k1", b"base").await.unwrap();
+        db.merge(b"k1", b"later").await.unwrap();
+        db.put(b"k9", b"keep").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        db.delete_range(b"k0"..b"k5").await.unwrap();
+        // A later merge after the range delete must remain visible.
+        db.merge(b"k1", b"after")
+            .await
+            .unwrap()
+            .await_durable()
+            .await
+            .unwrap();
+
+        // The post-delete merge folds against the surviving base value; the
+        // important contract is that it (not the range tombstone) wins.
+        assert_eq!(
+            db.get(b"k1").await.unwrap().unwrap().as_ref(),
+            b"baselaterafter"
+        );
+        assert_eq!(db.get(b"k9").await.unwrap().unwrap().as_ref(), b"keep");
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_range_delete_semantics_survive_compaction() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_range_delete_compaction";
+        let should_compact_l0 = Arc::new(AtomicBool::new(false));
+        let this_should_compact_l0 = should_compact_l0.clone();
+        let compaction_scheduler = Arc::new(OnDemandCompactionSchedulerSupplier::new(Arc::new(
+            move |_state| this_should_compact_l0.swap(false, Ordering::SeqCst),
+        )));
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(test_db_options(1024, 1024, None))
+            .with_compactor_builder(
+                CompactorBuilder::new(path, object_store.clone())
+                    .with_scheduler_supplier(compaction_scheduler.clone())
+                    .with_options(fast_compactor_options()),
+            )
+            .build()
+            .await
+            .unwrap();
+        let db = Arc::new(db);
+
+        for i in 1..=5 {
+            db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())
+                .await
+                .unwrap();
+        }
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let snapshot = db.snapshot().await.unwrap();
+
+        db.delete_range("k2".."k5").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        // One compaction drains both L0s (data + range tombstone) into a run.
+        should_compact_l0.store(true, Ordering::SeqCst);
+        let db_poll = db.clone();
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            loop {
+                {
+                    let db_state = db_poll.inner.state.read();
+                    if !db_state.state().core().tree.compacted.is_empty() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(db.get(b"k1").await.unwrap().unwrap().as_ref(), b"v1");
+        assert!(db.get(b"k2").await.unwrap().is_none());
+        assert!(db.get(b"k3").await.unwrap().is_none());
+        assert!(db.get(b"k4").await.unwrap().is_none());
+        assert_eq!(db.get(b"k5").await.unwrap().unwrap().as_ref(), b"v5");
+
+        // Snapshot pinned before the deletion still reads its old values after
+        // the range tombstone has been carried through compaction.
+        assert_eq!(snapshot.get(b"k3").await.unwrap().unwrap().as_ref(), b"v3");
+        assert_eq!(snapshot.get(b"k2").await.unwrap().unwrap().as_ref(), b"v2");
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ use crate::format::row::RowFlags;
 use crate::types::ValueDeletable;
 use crate::utils::{decode_varint, encode_varint, varint_len};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::fmt;
 
 /// Intermediate representation for V2 row encoding.
 ///
@@ -33,7 +34,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 /// - Sequence numbers are typically large (monotonically increasing counters)
 /// - Timestamps are 64-bit values that rarely benefit from varint compression
 /// - Fixed-width encoding simplifies parsing and provides predictable performance
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct SstRowEntryV2 {
     /// Bytes shared with previous key (0 at restart points)
     pub shared_bytes: u32,
@@ -43,6 +44,23 @@ pub(crate) struct SstRowEntryV2 {
     pub expire_ts: Option<i64>,
     pub create_ts: Option<i64>,
     pub value: ValueDeletable,
+    /// `Some(end)` marks this row as a range tombstone.
+    pub range_end_bound: Option<std::ops::Bound<Bytes>>,
+    /// Whether the range start (the row key) is inclusive.
+    pub range_start_inclusive: bool,
+}
+
+impl fmt::Debug for SstRowEntryV2 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SstRowEntryV2")
+            .field("shared_bytes", &self.shared_bytes)
+            .field("key_suffix", &self.key_suffix)
+            .field("seq", &self.seq)
+            .field("expire_ts", &self.expire_ts)
+            .field("create_ts", &self.create_ts)
+            .field("value", &self.value)
+            .finish()
+    }
 }
 
 impl SstRowEntryV2 {
@@ -61,6 +79,31 @@ impl SstRowEntryV2 {
             expire_ts,
             create_ts,
             value,
+            range_end_bound: None,
+            range_start_inclusive: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_range(
+        shared_bytes: u32,
+        key_suffix: Bytes,
+        seq: u64,
+        value: ValueDeletable,
+        create_ts: Option<i64>,
+        expire_ts: Option<i64>,
+        range_end_bound: Option<std::ops::Bound<Bytes>>,
+        range_start_inclusive: bool,
+    ) -> Self {
+        Self {
+            shared_bytes,
+            key_suffix,
+            seq,
+            expire_ts,
+            create_ts,
+            value,
+            range_end_bound,
+            range_start_inclusive,
         }
     }
 
@@ -70,6 +113,9 @@ impl SstRowEntryV2 {
             ValueDeletable::Merge(_) => RowFlags::MERGE_OPERAND,
             ValueDeletable::Tombstone => RowFlags::TOMBSTONE,
         };
+        if self.range_end_bound.is_some() {
+            flags |= RowFlags::RANGE_TOMBSTONE;
+        }
         if self.expire_ts.is_some() {
             flags |= RowFlags::HAS_EXPIRE_TS;
         }
@@ -92,9 +138,18 @@ impl SstRowEntryV2 {
     pub(crate) fn encoded_size(&self) -> usize {
         let shared_bytes_len = varint_len(self.shared_bytes);
         let unshared_bytes_len = varint_len(self.key_suffix.len() as u32);
-        let value_len = match &self.value {
-            ValueDeletable::Value(v) | ValueDeletable::Merge(v) => v.len(),
-            ValueDeletable::Tombstone => 0,
+        let value_len = match (&self.value, self.range_end_bound.as_ref()) {
+            (_, Some(end)) => {
+                // start_flag + end_flag + u32 end_len + end key
+                1 + 1
+                    + 4
+                    + match end {
+                        std::ops::Bound::Included(k) | std::ops::Bound::Excluded(k) => k.len(),
+                        std::ops::Bound::Unbounded => 0,
+                    }
+            }
+            (ValueDeletable::Value(v), _) | (ValueDeletable::Merge(v), _) => v.len(),
+            (ValueDeletable::Tombstone, None) => 0,
         };
         let value_len_varint_size = varint_len(value_len as u32);
 
@@ -129,9 +184,17 @@ impl SstRowCodecV2 {
         encode_varint(output, row.shared_bytes);
         encode_varint(output, row.key_suffix.len() as u32);
 
-        let value_len = match &row.value {
-            ValueDeletable::Value(v) | ValueDeletable::Merge(v) => v.len(),
-            ValueDeletable::Tombstone => 0,
+        let value_len = match (&row.value, row.range_end_bound.as_ref()) {
+            (_, Some(end)) => {
+                1 + 1
+                    + 4
+                    + match end {
+                        std::ops::Bound::Included(k) | std::ops::Bound::Excluded(k) => k.len(),
+                        std::ops::Bound::Unbounded => 0,
+                    }
+            }
+            (ValueDeletable::Value(v), _) | (ValueDeletable::Merge(v), _) => v.len(),
+            (ValueDeletable::Tombstone, None) => 0,
         };
         encode_varint(output, value_len as u32);
 
@@ -140,6 +203,17 @@ impl SstRowCodecV2 {
 
         // Encode value (if not tombstone)
         match &row.value {
+            _ if row.range_end_bound.is_some() => {
+                let end = row
+                    .range_end_bound
+                    .as_ref()
+                    .expect("range tombstone row must carry an end bound");
+                let payload = crate::range_tombstone::RangeTombstone::encode_row_payload(
+                    row.range_start_inclusive,
+                    end.as_ref(),
+                );
+                output.put(payload.as_ref());
+            }
             ValueDeletable::Value(v) | ValueDeletable::Merge(v) => {
                 output.put(v.as_ref());
             }
@@ -201,6 +275,33 @@ impl SstRowCodecV2 {
             };
 
         // Determine value type
+        if flags.contains(RowFlags::RANGE_TOMBSTONE) {
+            let payload = value_bytes.ok_or_else(|| SlateDBError::InvalidRowFlags {
+                encoded_bits: flags.bits(),
+                known_bits: RowFlags::all().bits(),
+                message: "corrupt range tombstone row".to_string(),
+            })?;
+            let mut payload = payload;
+            let (start_inclusive, end_bound) =
+                crate::range_tombstone::RangeTombstone::decode_row_payload(&mut payload).map_err(
+                    |_| SlateDBError::InvalidRowFlags {
+                        encoded_bits: flags.bits(),
+                        known_bits: RowFlags::all().bits(),
+                        message: "corrupt range tombstone row".to_string(),
+                    },
+                )?;
+            return Ok(SstRowEntryV2::with_range(
+                shared_bytes,
+                key_suffix,
+                seq,
+                ValueDeletable::Tombstone,
+                create_ts,
+                expire_ts,
+                Some(end_bound),
+                start_inclusive,
+            ));
+        }
+
         let value = if flags.contains(RowFlags::TOMBSTONE) {
             ValueDeletable::Tombstone
         } else if flags.contains(RowFlags::MERGE_OPERAND) {
@@ -216,6 +317,8 @@ impl SstRowCodecV2 {
             expire_ts,
             create_ts,
             value,
+            range_end_bound: None,
+            range_start_inclusive: false,
         })
     }
 
@@ -243,6 +346,13 @@ impl SstRowCodecV2 {
                 encoded_bits: parsed.bits(),
                 known_bits: RowFlags::all().bits(),
                 message: "Tombstone and Merge Operand are mutually exclusive.".to_string(),
+            });
+        }
+        if parsed.contains(RowFlags::RANGE_TOMBSTONE) && !parsed.contains(RowFlags::TOMBSTONE) {
+            return Err(SlateDBError::InvalidRowFlags {
+                encoded_bits: parsed.bits(),
+                known_bits: RowFlags::all().bits(),
+                message: "Range tombstones must also carry the tombstone flag.".to_string(),
             });
         }
         Ok(parsed)

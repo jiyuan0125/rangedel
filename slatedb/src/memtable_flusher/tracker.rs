@@ -738,6 +738,8 @@ mod tests {
                 stats_offset: 0,
                 stats_len: 0,
                 filter_format: FilterFormat::default(),
+                range_tombstones_offset: 0,
+                range_tombstones_len: 0,
             },
         )
     }

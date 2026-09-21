@@ -4,6 +4,7 @@
 //! collection of write operations (puts and/or deletes) that are applied
 //! atomically to the database.
 
+use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::config::{MergeOptions, PutOptions};
 use crate::db_common::extract_segment_prefix;
 use crate::error::SlateDBError;
@@ -51,6 +52,9 @@ use std::ops::RangeBounds;
 #[derive(Clone, Debug)]
 pub struct WriteBatch {
     pub(crate) ops: BTreeMap<Bytes, SmallVec<[WriteOp; 1]>>,
+    /// Interval deletes applied atomically with the point ops in `ops`. Kept
+    /// separate from `ops` because one entry covers an arbitrary key range.
+    pub(crate) range_deletes: SmallVec<[BytesRange; 1]>,
     pub(crate) op_count: usize,
     pub(crate) has_merge_ops: bool,
 }
@@ -137,6 +141,7 @@ impl WriteBatch {
     pub fn new() -> Self {
         WriteBatch {
             ops: BTreeMap::new(),
+            range_deletes: smallvec![],
             op_count: 0,
             has_merge_ops: false,
         }
@@ -274,8 +279,27 @@ impl WriteBatch {
         }
     }
 
+    /// Delete every key in `range` atomically with the rest of the batch.
+    ///
+    /// The bounds use the same inclusive/exclusive semantics as
+    /// [`crate::Db::scan`]: `a..b` is half open, `a..=b` is inclusive at
+    /// both ends, and `..`/`a..`/`..=b` express unbounded sides. Like the
+    /// point operations in this batch, the deletion takes effect at one
+    /// sequence number: it hides only data written before it, never later
+    /// puts.
+    pub fn delete_range<T>(&mut self, range: T)
+    where
+        T: ByteRangeBounds,
+    {
+        let start = range.start_bound().map(Bytes::copy_from_slice);
+        let end = range.end_bound().map(Bytes::copy_from_slice);
+        let range = BytesRange::from((start, end));
+        self.range_deletes.push(range);
+        self.op_count += 1;
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
+        self.ops.is_empty() && self.range_deletes.is_empty()
     }
 
     pub(crate) fn has_merge_ops(&self) -> bool {
@@ -288,6 +312,15 @@ impl WriteBatch {
 
     pub(crate) fn keys(&self) -> HashSet<Bytes> {
         self.ops.keys().cloned().collect()
+    }
+
+    /// Uncommitted range deletions in this batch, as tombstone values at the
+    /// supplied (commit) sequence number.
+    pub(crate) fn range_tombstones(&self, seq: u64) -> Vec<crate::range_tombstone::RangeTombstone> {
+        self.range_deletes
+            .iter()
+            .map(|range| crate::range_tombstone::RangeTombstone::new(range.clone(), seq))
+            .collect()
     }
 
     /// Converts a WriteBatch into a vector of RowEntry objects with
@@ -359,6 +392,20 @@ impl WriteBatch {
             entries_bytes += (entry.key.len() + entry.value.len()) as u64;
             entries.push(entry);
         }
+        // Range deletes share the batch's commit sequence number and travel in
+        // the same WAL append, so the batch is atomic. They are appended after
+        // point entries and never participate in merge folding.
+        for range in &self.range_deletes {
+            let (start, end) = (
+                RangeBounds::start_bound(range).cloned(),
+                RangeBounds::end_bound(range).cloned(),
+            );
+            let (key, start_inclusive) =
+                crate::range_tombstone::RangeTombstone::row_key_from_start_bound(start);
+            let entry = RowEntry::new_range_tombstone(key, start_inclusive, end, seq, None);
+            entries_bytes += entry.estimated_size() as u64;
+            entries.push(entry);
+        }
         Ok((entries, touched_segments, entries_bytes))
     }
 }
@@ -393,6 +440,8 @@ pub mod benches {
 /// Iterator over `WriteBatch` entries.
 pub(crate) struct WriteBatchIterator {
     iter: Peekable<Box<dyn Iterator<Item = RowEntry> + Send + Sync>>,
+    /// Range tombstones buffered in the batch, visible to in-transaction reads.
+    range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
     ordering: IterationOrder,
 }
 
@@ -428,7 +477,7 @@ impl WriteBatchIterator {
         now: Option<i64>,
         default_ttl_millis: Option<u64>,
     ) -> Self {
-        let entries: Vec<RowEntry> = match ordering {
+        let mut entries: Vec<RowEntry> = match ordering {
             IterationOrder::Ascending => batch
                 .ops
                 .range(range)
@@ -444,12 +493,43 @@ impl WriteBatchIterator {
                 .collect(),
         };
 
+        // Uncommitted range deletions in the batch shadow reads. They sort by
+        // key so `seek` inside the merge iterator still works; the merge layer
+        // strips them from point output using the side collection.
+        // All batch range deletes are visible to transaction reads; the merge
+        // layer filters them by the scan bounds via the interval itself.
+        let mut range_entries: Vec<RowEntry> = batch
+            .range_deletes
+            .iter()
+            .map(|tombstone_range| {
+                let (start, end) = (
+                    RangeBounds::start_bound(tombstone_range).cloned(),
+                    RangeBounds::end_bound(tombstone_range).cloned(),
+                );
+                let (key, start_inclusive) =
+                    crate::range_tombstone::RangeTombstone::row_key_from_start_bound(start);
+                RowEntry::new_range_tombstone(key, start_inclusive, end, seq, now)
+            })
+            .collect();
+        range_entries.sort_by(|a, b| match ordering {
+            IterationOrder::Ascending => a.key.cmp(&b.key),
+            IterationOrder::Descending => b.key.cmp(&a.key),
+        });
+        entries.extend(range_entries);
+
+        let range_tombstones = batch.range_tombstones(seq);
+
         let iter: Box<dyn Iterator<Item = RowEntry> + Send + Sync> = Box::new(entries.into_iter());
 
         Self {
             iter: iter.peekable(),
+            range_tombstones,
             ordering,
         }
+    }
+
+    pub(crate) fn range_tombstones_ref(&self) -> &Vec<crate::range_tombstone::RangeTombstone> {
+        &self.range_tombstones
     }
 }
 

@@ -521,6 +521,10 @@ pub struct SsTableInfo {
     pub stats_len: u64,
     /// Filter block format.
     pub filter_format: FilterFormat,
+    /// Offset of the range tombstone side block, if any.
+    pub range_tombstones_offset: u64,
+    /// Length of the range tombstone side block.
+    pub range_tombstones_len: u64,
 }
 
 impl SsTableInfo {

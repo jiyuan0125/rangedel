@@ -399,13 +399,15 @@ pub(crate) fn decode_codec_entries(
         // Update last_key for the next entry
         last_key = full_key.clone();
 
-        let row_entry = RowEntry {
-            key: full_key,
-            value: sst_row_entry.value,
-            seq: sst_row_entry.seq,
-            create_ts: sst_row_entry.create_ts,
-            expire_ts: sst_row_entry.expire_ts,
-        };
+        let row_entry = RowEntry::with_range_fields(
+            full_key,
+            sst_row_entry.value,
+            sst_row_entry.seq,
+            sst_row_entry.create_ts,
+            sst_row_entry.expire_ts,
+            None,
+            false,
+        );
         entries.push(row_entry);
     }
 

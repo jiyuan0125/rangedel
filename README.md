@@ -60,6 +60,12 @@ async fn main() -> Result<(), Error> {
     kv_store.delete(key).await?;
     assert!(kv_store.get(key).await?.is_none());
 
+    // Delete an entire key range as one O(1) range tombstone. Bounds use the
+    // same syntax as scan: half-open here, `..=` for an inclusive end.
+    kv_store.delete_range("test_key1".."test_key4").await?;
+    assert!(kv_store.get("test_key1").await?.is_none());
+    assert_eq!(kv_store.get("test_key4").await?, Some("test_value4".into()));
+
     kv_store.put(b"test_key1", b"test_value1").await?;
     kv_store.put(b"test_key2", b"test_value2").await?;
     kv_store.put(b"test_key3", b"test_value3").await?;
@@ -136,7 +142,7 @@ Visit [slatedb.io](https://slatedb.io) to learn more.
 - [x] Transactions ([#785](https://github.com/slatedb/slatedb/issues/785))
 - [x] Merge operator ([#328](https://github.com/slatedb/slatedb/issues/328))
 - [x] Clones ([#49](https://github.com/slatedb/slatedb/issues/49))
-- [ ] Range deletions ([#577](https://github.com/slatedb/slatedb/issues/577))
+- [x] Range deletions (`Db::delete_range` / `WriteBatch::delete_range`, [#577](https://github.com/slatedb/slatedb/issues/577))
 - [x] Change data capture (CDC) ([#249](https://github.com/slatedb/slatedb/issues/249))
 - [x] Database split/merge ([RFC](https://github.com/slatedb/slatedb/blob/main/rfcs/0004-checkpoints.md#manifest-projection-and-union))
 

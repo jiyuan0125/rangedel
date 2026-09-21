@@ -152,13 +152,15 @@ impl BlockBuilderV1 {
 
         let key_suffix = entry.key.slice(key_prefix_len..);
 
-        let sst_row_entry = SstRowEntry::new(
+        let sst_row_entry = SstRowEntry::with_range(
             key_prefix_len,
             key_suffix,
             entry.seq,
             entry.value,
             entry.create_ts,
             entry.expire_ts,
+            entry.end_bound,
+            entry.start_inclusive,
         );
 
         self.offsets.push(self.data.len() as u16);

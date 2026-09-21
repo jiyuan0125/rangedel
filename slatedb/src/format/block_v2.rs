@@ -130,13 +130,15 @@ impl BlockBuilderV2 {
         };
         let key_suffix = &entry.key[shared_bytes as usize..];
 
-        let temp_entry = SstRowEntryV2::new(
+        let temp_entry = SstRowEntryV2::with_range(
             shared_bytes,
             Bytes::copy_from_slice(key_suffix),
             entry.seq,
             entry.value.clone(),
             entry.create_ts,
             entry.expire_ts,
+            entry.end_bound.clone(),
+            entry.start_inclusive,
         );
         temp_entry.encoded_size()
     }
@@ -205,13 +207,15 @@ impl BlockBuilderV2 {
 
         let key_suffix = Bytes::copy_from_slice(&entry.key[shared_bytes as usize..]);
 
-        let sst_row = SstRowEntryV2::new(
+        let sst_row = SstRowEntryV2::with_range(
             shared_bytes,
             key_suffix,
             entry.seq,
             entry.value,
             entry.create_ts,
             entry.expire_ts,
+            entry.end_bound,
+            entry.start_inclusive,
         );
 
         let codec = SstRowCodecV2::new();

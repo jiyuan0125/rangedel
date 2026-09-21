@@ -18,6 +18,7 @@ use crate::db_common::extract_segment_prefix;
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::prefix_extractor::PrefixExtractor;
+use crate::range_tombstone::RangeTombstone;
 use crate::reader::ReadTrace;
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
 use crate::types::RowEntry;
@@ -110,6 +111,11 @@ pub(crate) struct KVTable {
     /// paths after the antichain check. Empty when no extractor is
     /// configured.
     touched_segments: Mutex<std::collections::BTreeSet<Bytes>>,
+    /// Range tombstones applied to this table, in insertion (roughly sequence)
+    /// order. Reads sort/copy as needed; appends are O(1) so a 100k-key
+    /// interval delete costs one entry here.
+    range_tombstones: Mutex<Vec<RangeTombstone>>,
+    range_tombstones_size_in_bytes: AtomicUsize,
 }
 
 pub(crate) struct KVTableMetadata {
@@ -376,6 +382,8 @@ impl KVTable {
             first_seq: AtomicU64::new(u64::MAX),
             sequence_tracker: Mutex::new(SequenceTracker::new()),
             touched_segments: Mutex::new(std::collections::BTreeSet::new()),
+            range_tombstones: Mutex::new(Vec::new()),
+            range_tombstones_size_in_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -474,7 +482,7 @@ impl KVTable {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.is_empty() && self.range_tombstones.lock().is_empty()
     }
 
     pub(crate) fn last_tick(&self) -> i64 {
@@ -528,6 +536,16 @@ impl KVTable {
     }
 
     pub(crate) fn put(&self, row: RowEntry) {
+        if let Some(end_bound) = row.end_bound.clone() {
+            self.put_range_tombstone(RangeTombstone::new(
+                crate::bytes_range::BytesRange::new(
+                    RangeTombstone::start_bound_from_row_key(row.key.clone(), row.start_inclusive),
+                    end_bound,
+                ),
+                row.seq,
+            ));
+            return;
+        }
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
 
@@ -560,6 +578,35 @@ impl KVTable {
             self.entries_size_in_bytes
                 .fetch_add(row_size, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn put_range_tombstone(&self, tombstone: RangeTombstone) {
+        let size = tombstone.range.start_bytes_len() + tombstone.range.end_bytes_len() + 16;
+        self.last_seq.fetch_max(tombstone.seq, SeqCst);
+        self.first_seq.fetch_min(tombstone.seq, SeqCst);
+        self.range_tombstones.lock().push(tombstone);
+        self.range_tombstones_size_in_bytes
+            .fetch_add(size, Ordering::Relaxed);
+    }
+
+    /// Range tombstones whose interval overlaps `range`, sorted by descending
+    /// sequence number. Used by scans to bound the side collection.
+    pub(crate) fn overlapping_range_tombstones(
+        &self,
+        range: &crate::bytes_range::BytesRange,
+    ) -> Vec<RangeTombstone> {
+        let tombstones = self.range_tombstones.lock();
+        let mut filtered: Vec<_> = tombstones
+            .iter()
+            .filter(|tombstone| tombstone.range.intersect(range).is_some())
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.seq.cmp(&a.seq));
+        filtered
+    }
+
+    pub(crate) fn range_tombstones(&self) -> Vec<RangeTombstone> {
+        self.range_tombstones.lock().clone()
     }
 
     pub(crate) fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {

@@ -1229,6 +1229,8 @@ impl<'a> SsTableInfo<'a> {
   pub const VT_STATS_OFFSET: flatbuffers::VOffsetT = 20;
   pub const VT_STATS_LEN: flatbuffers::VOffsetT = 22;
   pub const VT_FILTER_FORMAT: flatbuffers::VOffsetT = 24;
+  pub const VT_RANGE_TOMBSTONES_OFFSET: flatbuffers::VOffsetT = 26;
+  pub const VT_RANGE_TOMBSTONES_LEN: flatbuffers::VOffsetT = 28;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1248,6 +1250,8 @@ impl<'a> SsTableInfo<'a> {
     builder.add_index_offset(args.index_offset);
     if let Some(x) = args.last_entry { builder.add_last_entry(x); }
     if let Some(x) = args.first_entry { builder.add_first_entry(x); }
+    builder.add_range_tombstones_len(args.range_tombstones_len);
+    builder.add_range_tombstones_offset(args.range_tombstones_offset);
     builder.add_filter_format(args.filter_format);
     builder.add_sst_type(args.sst_type);
     builder.add_compression_format(args.compression_format);
@@ -1332,6 +1336,20 @@ impl<'a> SsTableInfo<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<FilterFormat>(SsTableInfo::VT_FILTER_FORMAT, Some(FilterFormat::Legacy)).unwrap()}
   }
+  #[inline]
+  pub fn range_tombstones_offset(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(SsTableInfo::VT_RANGE_TOMBSTONES_OFFSET, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn range_tombstones_len(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(SsTableInfo::VT_RANGE_TOMBSTONES_LEN, Some(0)).unwrap()}
+  }
 }
 
 impl flatbuffers::Verifiable for SsTableInfo<'_> {
@@ -1352,6 +1370,8 @@ impl flatbuffers::Verifiable for SsTableInfo<'_> {
      .visit_field::<u64>("stats_offset", Self::VT_STATS_OFFSET, false)?
      .visit_field::<u64>("stats_len", Self::VT_STATS_LEN, false)?
      .visit_field::<FilterFormat>("filter_format", Self::VT_FILTER_FORMAT, false)?
+     .visit_field::<u64>("range_tombstones_offset", Self::VT_RANGE_TOMBSTONES_OFFSET, false)?
+     .visit_field::<u64>("range_tombstones_len", Self::VT_RANGE_TOMBSTONES_LEN, false)?
      .finish();
     Ok(())
   }
@@ -1368,6 +1388,8 @@ pub struct SsTableInfoArgs<'a> {
     pub stats_offset: u64,
     pub stats_len: u64,
     pub filter_format: FilterFormat,
+    pub range_tombstones_offset: u64,
+    pub range_tombstones_len: u64,
 }
 impl<'a> Default for SsTableInfoArgs<'a> {
   #[inline]
@@ -1384,6 +1406,8 @@ impl<'a> Default for SsTableInfoArgs<'a> {
       stats_offset: 0,
       stats_len: 0,
       filter_format: FilterFormat::Legacy,
+      range_tombstones_offset: 0,
+      range_tombstones_len: 0,
     }
   }
 }
@@ -1438,6 +1462,14 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> SsTableInfoBuilder<'a, 'b, A> {
     self.fbb_.push_slot::<FilterFormat>(SsTableInfo::VT_FILTER_FORMAT, filter_format, FilterFormat::Legacy);
   }
   #[inline]
+  pub fn add_range_tombstones_offset(&mut self, range_tombstones_offset: u64) {
+    self.fbb_.push_slot::<u64>(SsTableInfo::VT_RANGE_TOMBSTONES_OFFSET, range_tombstones_offset, 0);
+  }
+  #[inline]
+  pub fn add_range_tombstones_len(&mut self, range_tombstones_len: u64) {
+    self.fbb_.push_slot::<u64>(SsTableInfo::VT_RANGE_TOMBSTONES_LEN, range_tombstones_len, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> SsTableInfoBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     SsTableInfoBuilder {
@@ -1466,6 +1498,8 @@ impl core::fmt::Debug for SsTableInfo<'_> {
       ds.field("stats_offset", &self.stats_offset());
       ds.field("stats_len", &self.stats_len());
       ds.field("filter_format", &self.filter_format());
+      ds.field("range_tombstones_offset", &self.range_tombstones_offset());
+      ds.field("range_tombstones_len", &self.range_tombstones_len());
       ds.finish()
   }
 }

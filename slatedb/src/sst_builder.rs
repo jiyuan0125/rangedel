@@ -54,6 +54,7 @@
 //! and before decompression on read.
 
 use std::collections::VecDeque;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use crate::config::CompressionCodec;
@@ -143,6 +144,8 @@ pub(crate) struct EncodedSsTableBuilder {
     sst_codec: Box<dyn SsTableInfoCodec>,
     compression_codec: Option<CompressionCodec>,
     block_transformer: Option<Arc<dyn BlockTransformer>>,
+    /// Buffered range tombstones for the side block.
+    range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
 }
 
 impl EncodedSsTableBuilder {
@@ -177,6 +180,7 @@ impl EncodedSsTableBuilder {
             sst_codec,
             compression_codec: None,
             block_transformer: None,
+            range_tombstones: Vec::new(),
         }
     }
 
@@ -222,6 +226,17 @@ impl EncodedSsTableBuilder {
     /// The block size is calculated after applying any compression if enabled.
     /// The block size is None if the builder has not finished compacting a block yet.
     pub(crate) async fn add(&mut self, entry: RowEntry) -> Result<Option<usize>, SlateDBError> {
+        if let Some(end_bound) = entry.end_bound.clone() {
+            let start = crate::range_tombstone::RangeTombstone::start_bound_from_row_key(
+                entry.key,
+                entry.start_inclusive,
+            );
+            self.add_range_tombstone(crate::range_tombstone::RangeTombstone::new(
+                crate::bytes_range::BytesRange::new(start, end_bound),
+                entry.seq,
+            ));
+            return Ok(None);
+        }
         self.stats.raw_key_size += entry.key.len() as u64;
         self.stats.raw_val_size += entry.value.len() as u64;
 
@@ -269,6 +284,51 @@ impl EncodedSsTableBuilder {
             expire_ts,
         );
         self.add(entry).await
+    }
+
+    /// Buffer a range tombstone for the SST's side block. Callers supply
+    /// tombstones already sorted by start key; `build` sorts defensively.
+    pub(crate) fn add_range_tombstone(
+        &mut self,
+        tombstone: crate::range_tombstone::RangeTombstone,
+    ) {
+        self.range_tombstones.push(tombstone);
+    }
+
+    pub(crate) fn has_range_tombstones(&self) -> bool {
+        !self.range_tombstones.is_empty()
+    }
+
+    /// Key envelope (first, last) covering every buffered range tombstone.
+    /// Unbounded sides map to the empty key for the start and `None` for the
+    /// end (the existing convention for open-ended SSTs).
+    fn range_envelope_from_tombstones(&self) -> (Option<Bytes>, Option<Bytes>) {
+        use std::ops::Bound;
+        let mut first: Option<Bytes> = None;
+        let mut last: Option<Bytes> = None;
+        for tombstone in &self.range_tombstones {
+            match tombstone.range.start_bound() {
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    first = Some(match first.take() {
+                        Some(existing) => existing.min(k.clone()),
+                        None => k.clone(),
+                    });
+                }
+                Bound::Unbounded => first = Some(Bytes::new()),
+            }
+            match tombstone.range.end_bound() {
+                // The envelope's last key is the inclusive end; an exclusive
+                // end is still a valid upper marker for pruning.
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    last = Some(match last.take() {
+                        Some(existing) => existing.max(k.clone()),
+                        None => k.clone(),
+                    });
+                }
+                Bound::Unbounded => last = None,
+            }
+        }
+        (first, last)
     }
 
     pub(crate) fn next_block(&mut self) -> Option<EncodedSsTableBlock> {
@@ -370,11 +430,19 @@ impl EncodedSsTableBuilder {
     pub(crate) async fn build(mut self) -> Result<EncodedSsTable, SlateDBError> {
         self.finish_block().await?;
 
+        // When an SST carries only range tombstones, its physical key envelope
+        // is the union of their intervals so SST pruning still works.
+        let (sst_first_key, sst_last_key) = if self.sst_first_key.is_some() {
+            (self.sst_first_key, self.sst_last_key)
+        } else {
+            self.range_envelope_from_tombstones()
+        };
+
         // Build footer (includes index building)
         let mut footer_builder = EncodedSsTableFooterBuilder::new(
             self.current_len,
-            self.sst_first_key,
-            self.sst_last_key,
+            sst_first_key,
+            sst_last_key,
             &*self.sst_codec,
             self.index_builder,
             self.block_meta,
@@ -402,6 +470,16 @@ impl EncodedSsTableBuilder {
             footer_builder = footer_builder.with_filters(filters);
         }
         footer_builder = footer_builder.with_stats(self.stats);
+
+        let range_payload = if self.range_tombstones.is_empty() {
+            None
+        } else {
+            let mut tombstones = std::mem::take(&mut self.range_tombstones);
+            tombstones.sort_by(|a, b| a.range.cmp(&b.range).then_with(|| a.seq.cmp(&b.seq)));
+            tombstones.dedup_by(|a, b| a == b);
+            Some(crate::range_tombstone::encode_range_tombstones(&tombstones))
+        };
+        footer_builder = footer_builder.with_range_tombstones(range_payload);
 
         let footer = footer_builder.build().await?;
 

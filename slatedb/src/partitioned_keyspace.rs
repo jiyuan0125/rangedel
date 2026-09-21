@@ -89,6 +89,11 @@ pub(crate) fn partitions_covering_range<T: RangePartitionedKeySpace>(
     start: Bound<&[u8]>,
     end: Bound<&[u8]>,
 ) -> Range<usize> {
+    // An SST can legitimately contain zero data blocks when it carries only a
+    // range tombstone side block. There are no point partitions to cover.
+    if keyspace.partitions() == 0 {
+        return 0..0;
+    }
     let start_idx = match start {
         Bound::Included(k) | Bound::Excluded(k) => {
             first_partition_including_or_after_key(keyspace, k)

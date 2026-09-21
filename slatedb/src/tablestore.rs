@@ -515,6 +515,24 @@ impl TableStore {
         .await
     }
 
+    /// Reads the range tombstone side block of an SST, if present.
+    pub(crate) async fn read_range_tombstones(
+        &self,
+        handle: &SsTableHandle,
+        segment: Option<Bytes>,
+    ) -> Result<Vec<crate::range_tombstone::RangeTombstone>, SlateDBError> {
+        if handle.info.range_tombstones_len == 0 {
+            return Ok(Vec::new());
+        }
+        read_obj!(
+            &self.object_store,
+            self.path(&handle.id),
+            ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment),
+            |obj| self.sst_format.read_range_tombstones(&handle.info, &obj)
+        )
+        .await
+    }
+
     /// Reads the index of an SSTable.
     ///
     /// ## Arguments
@@ -1108,6 +1126,19 @@ impl EncodedSsTableWriter {
         let block_size = self.builder.add(entry).await?;
         self.drain_blocks().await?;
         Ok(block_size)
+    }
+
+    /// Buffer a range tombstone into the SST's side block. Unlike
+    /// [`Self::add`], this never writes point data blocks.
+    pub(crate) fn add_range_tombstone(
+        &mut self,
+        tombstone: crate::range_tombstone::RangeTombstone,
+    ) {
+        self.builder.add_range_tombstone(tombstone);
+    }
+
+    pub(crate) fn has_range_tombstones(&self) -> bool {
+        self.builder.has_range_tombstones()
     }
 
     /// Finish this SST: write the last block, write the footer, close

@@ -293,6 +293,7 @@ mod tests {
     use crate::block_iterator::BlockIteratorLatest;
     use crate::flatbuffer_types::FlatBufferSsTableInfoCodec;
     use crate::format::block::Block;
+    use crate::iter::RowEntryIterator;
     use crate::test_utils::assert_iterator;
     use crate::types::ValueDeletable;
 
@@ -444,6 +445,35 @@ mod tests {
             RowEntry::new_value(b"key2", b"value2", 2).with_create_ts(200),
         ];
         assert_iterator(&mut iter, expected).await;
+    }
+
+    #[tokio::test]
+    async fn should_round_trip_range_tombstone_rows() {
+        use std::ops::Bound;
+        let mut builder =
+            EncodedWalSsTableBuilder::new(1024, Box::new(FlatBufferSsTableInfoCodec {}));
+        let range_row = RowEntry::new_range_tombstone(
+            Bytes::from_static(b"k2"),
+            true,
+            Bound::Included(Bytes::from_static(b"k4")),
+            7,
+            None,
+        );
+        builder.add(range_row.clone()).await.unwrap();
+
+        let mut encoded = builder.build().await.unwrap();
+        let block = encoded.unconsumed_blocks.pop_front().unwrap();
+        let mut iter = BlockIteratorLatest::new_ascending(block.block);
+        let decoded = iter.next().await.unwrap().unwrap();
+        assert_eq!(decoded.key.as_ref(), b"k2");
+        assert_eq!(decoded.seq, 7);
+        assert!(decoded.is_range_tombstone());
+        assert!(decoded.start_inclusive);
+        assert_eq!(
+            decoded.end_bound,
+            Some(Bound::Included(Bytes::from_static(b"k4")))
+        );
+        assert!(iter.next().await.unwrap().is_none());
     }
 
     #[tokio::test]

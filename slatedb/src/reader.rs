@@ -10,6 +10,8 @@ use crate::manifest::{ManifestCore, Segment};
 use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
 use crate::oracle::Oracle;
+use crate::range_tombstone::RangeTombstone;
+use crate::range_tombstone_iter::merge_tombstone_collections;
 use crate::segment_iterator::{build_segment_iter, SegmentScanContext};
 use crate::sorted_run_iterator::SortedRunIterator;
 use crate::sst_iter::{SstIterator, SstIteratorOptions, SstTracingContext};
@@ -280,6 +282,65 @@ impl Reader {
             .collect()
     }
 
+    /// Collect every visible range tombstone overlapping `range` from the
+    /// memtables and on-disk segments. `max_seq` is applied here (rather than
+    /// at point-row filtering time) so a snapshot opened before a range
+    /// deletion does not observe that deletion.
+    async fn collect_range_tombstones(
+        &self,
+        range: &BytesRange,
+        db_state: &(dyn DbStateReader + Sync),
+        max_seq: Option<u64>,
+    ) -> Result<Vec<RangeTombstone>, SlateDBError> {
+        let mut collections: Vec<Vec<RangeTombstone>> = Vec::new();
+
+        let mut memtables = VecDeque::new();
+        memtables.push_back(db_state.memtable());
+        for memtable in db_state.imm_memtable() {
+            memtables.push_back(memtable.table());
+        }
+        for table in &memtables {
+            collections.push(table.overlapping_range_tombstones(range));
+        }
+
+        let default_seg;
+        let segments: &[Segment] = match db_state.core().select_segments(range) {
+            Some(segments) => segments,
+            None => {
+                default_seg = db_state.core().default_segment();
+                std::slice::from_ref(&default_seg)
+            }
+        };
+
+        for segment in segments {
+            let segment_prefix = Some(segment.prefix.clone());
+            for sst in segment.tree.l0.iter() {
+                if sst.compacted_effective_range().intersect(range).is_some() {
+                    let tombstones = self
+                        .table_store
+                        .read_range_tombstones(&sst.sst, segment_prefix.clone())
+                        .await?;
+                    collections.push(tombstones);
+                }
+            }
+            for sorted_run in &segment.tree.compacted {
+                for sst in sorted_run.tables_covering_range(range.clone()) {
+                    let tombstones = self
+                        .table_store
+                        .read_range_tombstones(&sst.sst, segment_prefix.clone())
+                        .await?;
+                    collections.push(tombstones);
+                }
+            }
+        }
+
+        let mut merged = merge_tombstone_collections(collections);
+        if let Some(max_seq) = max_seq {
+            merged.retain(|tombstone| tombstone.seq <= max_seq);
+        }
+        Ok(merged)
+    }
+
     async fn build_iterator_sources(
         &self,
         range: &BytesRange,
@@ -399,6 +460,16 @@ impl Reader {
             )
             .await?;
 
+        let batch_tombstones = write_batch_iter
+            .as_ref()
+            .map(WriteBatchIterator::range_tombstones_ref)
+            .cloned()
+            .unwrap_or_default();
+        let mut stored_tombstones = self
+            .collect_range_tombstones(&range, db_state, max_seq)
+            .await?;
+        stored_tombstones.extend(batch_tombstones);
+
         let mut iterator = DbIterator::new(
             range,
             write_batch_iter,
@@ -408,6 +479,7 @@ impl Reader {
             self.read_merge_operator.clone(),
             sst_iter_options.order,
             read_trace,
+            stored_tombstones,
         )
         .await?;
 
@@ -488,6 +560,16 @@ impl Reader {
             )
             .await?;
 
+        let batch_tombstones = write_batch_iter
+            .as_ref()
+            .map(WriteBatchIterator::range_tombstones_ref)
+            .cloned()
+            .unwrap_or_default();
+        let mut stored_tombstones = self
+            .collect_range_tombstones(&range, ctx.db_state, max_seq)
+            .await?;
+        stored_tombstones.extend(batch_tombstones);
+
         DbIterator::new(
             range,
             write_batch_iter,
@@ -497,6 +579,7 @@ impl Reader {
             self.read_merge_operator.clone(),
             options.order,
             read_trace,
+            stored_tombstones,
         )
         .await
     }

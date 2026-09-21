@@ -101,12 +101,14 @@ impl<B: BlockLike> AscendingState<B> {
         let full_key = entry.restore_full_key(&self.current_key);
 
         Ok((
-            RowEntry::new(
+            RowEntry::with_range_fields(
                 full_key,
                 entry.value,
                 entry.seq,
                 entry.create_ts,
                 entry.expire_ts,
+                entry.range_end_bound,
+                entry.range_start_inclusive,
             ),
             new_offset,
         ))

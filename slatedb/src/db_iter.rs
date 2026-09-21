@@ -8,6 +8,8 @@ use crate::merge_iterator::MergeIterator;
 use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
+use crate::range_tombstone::RangeTombstone;
+use crate::range_tombstone_iter::RangeTombstoneIterator;
 use crate::reader::ReadTrace;
 use crate::segment_iterator::{build_l0_point_iters, build_sr_point_iters, SegmentScanContext};
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
@@ -267,6 +269,7 @@ impl DbIterator {
         merge_operator: Option<MergeOperatorType>,
         order: IterationOrder,
         read_trace: ReadTrace,
+        range_tombstones: Vec<RangeTombstone>,
     ) -> Result<Self, SlateDBError> {
         let read_span = read_trace.read_span();
 
@@ -320,6 +323,10 @@ impl DbIterator {
             // When no merge operator is configured, wrap with iterator that errors on merge operands
             iter = Box::new(MergeOperatorRequiredIterator::new(iter));
         }
+
+        // Apply range tombstones after merge resolution: merge folding must
+        // see an operand's base point, then the shadowed result is dropped.
+        iter = Box::new(RangeTombstoneIterator::new(iter, range_tombstones, order));
 
         iter.init().instrument(read_span.clone()).await?;
 
@@ -765,6 +772,7 @@ mod tests {
             merge.then(|| Arc::new(StringConcatMergeOperator) as MergeOperatorType),
             order,
             ReadTrace::new(None),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -793,6 +801,7 @@ mod tests {
             None,
             IterationOrder::Ascending,
             ReadTrace::new(None),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -834,6 +843,7 @@ mod tests {
             None,
             IterationOrder::Ascending,
             ReadTrace::new(None),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -865,6 +875,7 @@ mod tests {
             None,
             IterationOrder::Ascending,
             ReadTrace::new(None),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -915,6 +926,7 @@ mod tests {
             None,
             IterationOrder::Ascending,
             ReadTrace::new(None),
+            Vec::new(),
         )
         .await
         .unwrap();

@@ -28,6 +28,8 @@ use crate::merge_operator::{
     MergeOperatorType,
 };
 use crate::peeking_iterator::PeekingIterator;
+use crate::range_tombstone::RangeTombstone;
+use crate::range_tombstone_iter::merge_tombstone_collections;
 use crate::retention_iterator::RetentionIterator;
 use crate::seq_tracker::SequenceTracker;
 use crate::sorted_run_iterator::SortedRunIterator;
@@ -784,6 +786,46 @@ impl TokioCompactionExecutorInner {
     /// output SSTs, including any `initial_output_ssts` written by a previous
     /// attempt. This is the shared execution path for whole compactions (an
     /// unbounded range) and subcompactions (RFC-0028).
+    /// Collect every range tombstone carried by the input SSTs that overlaps
+    /// this subcompaction's key range. Range tombstones are forwarded to the
+    /// output SSTs verbatim: dropping or shrinking them could expose old
+    /// values to a snapshot that still needs them. Space reclamation (based on
+    /// the oldest active snapshot) is intentionally left for a later change.
+    async fn collect_compaction_range_tombstones(
+        &self,
+        args: &SubcompactionArgs,
+    ) -> Result<Vec<RangeTombstone>, SlateDBError> {
+        let mut collections = Vec::new();
+        for sst in &args.l0_sst_views {
+            if sst
+                .compacted_effective_range()
+                .intersect(&args.range)
+                .is_some()
+            {
+                collections.push(
+                    self.table_store
+                        .read_range_tombstones(&sst.sst, Some(args.segment.clone()))
+                        .await?,
+                );
+            }
+        }
+        for sorted_run in &args.sorted_runs {
+            for sst in sorted_run.tables_covering_range(args.range.clone()) {
+                collections.push(
+                    self.table_store
+                        .read_range_tombstones(&sst.sst, Some(args.segment.clone()))
+                        .await?,
+                );
+            }
+        }
+        let merged = merge_tombstone_collections(collections);
+        // Only retain tombstones overlapping this subcompaction's range.
+        Ok(merged
+            .into_iter()
+            .filter(|tombstone| tombstone.range.intersect(&args.range).is_some())
+            .collect())
+    }
+
     async fn run_subcompaction_merge(
         &self,
         args: SubcompactionArgs,
@@ -792,10 +834,18 @@ impl TokioCompactionExecutorInner {
     ) -> Result<Vec<SsTableHandle>, SlateDBError> {
         let mut all_iter = self.load_iterators(&args, sequence_tracker).await?;
         let mut output_ssts = args.output_ssts.clone();
+        // Carried-forward range tombstones. Every SST this job emits gets the
+        // full collection; the SST side block is O(number of deletes), not O(
+        // number of deleted keys), so the duplication is bounded and the read
+        // envelope gating prevents spurious SST opens.
+        let carried_tombstones = self.collect_compaction_range_tombstones(&args).await?;
         let mut current_writer = self.table_store.table_writer(
             SsTableId::from(self.rand.rng().gen_ulid(self.clock.as_ref())),
             Some(args.segment.clone()),
         );
+        for tombstone in &carried_tombstones {
+            current_writer.add_range_tombstone(tombstone.clone());
+        }
         let mut bytes_written = 0usize;
         // Estimate bytes processed within this range before the resume point,
         // if any. For an unbounded range this is the estimate of everything
@@ -856,6 +906,9 @@ impl TokioCompactionExecutorInner {
                         Some(args.segment.clone()),
                     ),
                 );
+                for tombstone in &carried_tombstones {
+                    current_writer.add_range_tombstone(tombstone.clone());
+                }
                 pending_close = Some(AbortOnDropHandle::new(spawn_bg_task(
                     format!("compactor_sst_close:{:?}", finished_writer.id()),
                     &self.handle,

@@ -230,12 +230,14 @@ impl<B: BlockLike> BlockIterator<B> {
         let mut cursor = self.block.data().slice(off_usz..);
         let codec = SstRowCodecV0::new();
         let sst_row = codec.decode(&mut cursor)?;
-        Ok(Some(RowEntry::new(
+        Ok(Some(RowEntry::with_range_fields(
             sst_row.restore_full_key(&self.first_key),
             sst_row.value,
             sst_row.seq,
             sst_row.create_ts,
             sst_row.expire_ts,
+            sst_row.range_end_bound,
+            sst_row.range_start_inclusive,
         )))
     }
 

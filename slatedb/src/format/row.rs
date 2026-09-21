@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt;
 
 use crate::error::SlateDBError;
 use crate::types::ValueDeletable;
@@ -12,6 +12,9 @@ bitflags! {
         const HAS_EXPIRE_TS = 0b00000010;
         const HAS_CREATE_TS = 0b00000100;
         const MERGE_OPERAND = 0b00001000;
+        /// A range tombstone. The interval start is the row key and the end
+        /// bound is encoded in the value area.
+        const RANGE_TOMBSTONE = 0b00010000;
     }
 }
 
@@ -50,7 +53,7 @@ bitflags! {
 /// | `value_len`      | `u32` | Length of the value                                    |
 /// | `value`          | `var` | Value bytes                                            |
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct SstRowEntry {
     pub key_prefix_len: usize,
     pub key_suffix: Bytes,
@@ -58,6 +61,23 @@ pub(crate) struct SstRowEntry {
     pub expire_ts: Option<i64>,
     pub create_ts: Option<i64>,
     pub value: ValueDeletable,
+    /// `Some(end)` marks this row as a range tombstone.
+    pub range_end_bound: Option<std::ops::Bound<Bytes>>,
+    /// Whether the range start (the row key) is inclusive.
+    pub range_start_inclusive: bool,
+}
+
+impl fmt::Debug for SstRowEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SstRowEntry")
+            .field("key_prefix_len", &self.key_prefix_len)
+            .field("key_suffix", &self.key_suffix)
+            .field("seq", &self.seq)
+            .field("expire_ts", &self.expire_ts)
+            .field("create_ts", &self.create_ts)
+            .field("value", &self.value)
+            .finish()
+    }
 }
 
 impl SstRowEntry {
@@ -68,6 +88,28 @@ impl SstRowEntry {
         value: ValueDeletable,
         create_ts: Option<i64>,
         expire_ts: Option<i64>,
+    ) -> Self {
+        Self::with_range(
+            key_prefix_len,
+            key_suffix,
+            seq,
+            value,
+            create_ts,
+            expire_ts,
+            None,
+            false,
+        )
+    }
+
+    pub(crate) fn with_range(
+        key_prefix_len: usize,
+        key_suffix: Bytes,
+        seq: u64,
+        value: ValueDeletable,
+        create_ts: Option<i64>,
+        expire_ts: Option<i64>,
+        range_end_bound: Option<std::ops::Bound<Bytes>>,
+        range_start_inclusive: bool,
     ) -> Self {
         let key_suffix_len = key_suffix.len();
         assert!(
@@ -90,6 +132,8 @@ impl SstRowEntry {
             create_ts,
             expire_ts,
             value,
+            range_end_bound,
+            range_start_inclusive,
         }
     }
 
@@ -99,6 +143,9 @@ impl SstRowEntry {
             ValueDeletable::Merge(_) => RowFlags::MERGE_OPERAND,
             ValueDeletable::Tombstone => RowFlags::TOMBSTONE,
         };
+        if self.range_end_bound.is_some() {
+            flags |= RowFlags::RANGE_TOMBSTONE;
+        }
         if self.expire_ts.is_some() {
             flags |= RowFlags::HAS_EXPIRE_TS;
         }
@@ -121,7 +168,13 @@ impl SstRowEntry {
         if self.create_ts.is_some() {
             size += 8; // i64 create_ts
         }
-        if !matches!(self.value, ValueDeletable::Tombstone) {
+        if let Some(end) = &self.range_end_bound {
+            // value_len + start_flag + end_flag + u32 end_len + end key
+            size += 4 + 1 + 1 + 4;
+            if let std::ops::Bound::Included(end) | std::ops::Bound::Excluded(end) = end {
+                size += end.len();
+            }
+        } else if !matches!(self.value, ValueDeletable::Tombstone) {
             size += 4; // u32 value_len
             size += self.value.len(); // value
         }
@@ -186,6 +239,19 @@ impl SstRowCodecV0 {
         }
 
         match &row.value {
+            _ if flags.contains(RowFlags::RANGE_TOMBSTONE) => {
+                let end = row
+                    .range_end_bound
+                    .as_ref()
+                    .expect("range tombstone row must carry an end bound");
+                let payload = crate::range_tombstone::RangeTombstone::encode_row_payload(
+                    row.range_start_inclusive,
+                    end.as_ref(),
+                );
+                let value_len = u32::try_from(payload.len()).expect("range payload len > u32");
+                output.put_u32(value_len);
+                output.put(payload.as_ref());
+            }
             ValueDeletable::Value(v) | ValueDeletable::Merge(v) => {
                 let value_len = u32::try_from(v.len()).expect("value len > u32");
                 output.put_u32(value_len);
@@ -219,6 +285,30 @@ impl SstRowCodecV0 {
                 (None, None)
             };
 
+        // decode a range tombstone payload before the plain-tombstone shortcut
+        if flags.contains(RowFlags::RANGE_TOMBSTONE) {
+            let value_len = data.get_u32() as usize;
+            let mut payload = data.split_to(value_len);
+            let (start_inclusive, end_bound) =
+                crate::range_tombstone::RangeTombstone::decode_row_payload(&mut payload).map_err(
+                    |_| SlateDBError::InvalidRowFlags {
+                        encoded_bits: flags.bits(),
+                        known_bits: RowFlags::all().bits(),
+                        message: "corrupt range tombstone row".to_string(),
+                    },
+                )?;
+            return Ok(SstRowEntry::with_range(
+                key_prefix_len,
+                key_suffix,
+                seq,
+                ValueDeletable::Tombstone,
+                create_ts,
+                None,
+                Some(end_bound),
+                start_inclusive,
+            ));
+        }
+
         // skip decoding value for tombstone.
         if flags.contains(RowFlags::TOMBSTONE) {
             return Ok(SstRowEntry::new(
@@ -245,6 +335,8 @@ impl SstRowCodecV0 {
             } else {
                 ValueDeletable::Value(value)
             },
+            range_end_bound: None,
+            range_start_inclusive: false,
         })
     }
 
@@ -260,6 +352,13 @@ impl SstRowCodecV0 {
                 encoded_bits: parsed.bits(),
                 known_bits: RowFlags::all().bits(),
                 message: "Tombstone and Merge Operand are mutually exclusive.".to_string(),
+            });
+        }
+        if parsed.contains(RowFlags::RANGE_TOMBSTONE) && !parsed.contains(RowFlags::TOMBSTONE) {
+            return Err(SlateDBError::InvalidRowFlags {
+                encoded_bits: parsed.bits(),
+                known_bits: RowFlags::all().bits(),
+                message: "Range tombstones must also carry the tombstone flag.".to_string(),
             });
         }
         Ok(parsed)

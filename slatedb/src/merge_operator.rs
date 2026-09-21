@@ -444,6 +444,8 @@ impl<T: RowEntryIterator> MergeOperatorIterator<T> {
             seq: merge_tracker.seq,
             create_ts: merge_tracker.max_create_ts,
             expire_ts: merge_tracker.min_expire_ts,
+            end_bound: None,
+            start_inclusive: false,
         }))
     }
 }

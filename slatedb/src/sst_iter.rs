@@ -318,6 +318,12 @@ impl FilterEvaluator {
         self.state == FilterState::Negative
     }
 
+    /// Override a bloom-negative decision. Used when the SST also carries a
+    /// range tombstone side block that the point bloom cannot represent.
+    fn force_positive(&mut self) {
+        self.state = FilterState::Positive;
+    }
+
     fn notify_key_found(&mut self, key: &[u8]) {
         match &self.query.target {
             FilterTarget::Point(k) if key == k.as_ref() => self.found_key = true,
@@ -911,8 +917,24 @@ impl RowEntryIterator for FilterIterator<'_> {
             let filters = self.read_filters().await?;
             let sst_id = self.inner.view().table_as_ref().sst.id;
             let read_trace = self.inner.read_trace();
+            // A point bloom negative must not skip an SST that carries range
+            // tombstones: the tombstone lives in the side block and is absent
+            // from the point-key bloom, yet it may be the latest visible
+            // record for the looked-up key.
+            let has_range_tombstones = self
+                .inner
+                .view()
+                .table_as_ref()
+                .sst
+                .info
+                .range_tombstones_len
+                > 0;
             self.filter
                 .evaluate(&filters, sst_id, self.inner.sst_level(), &read_trace);
+
+            if self.is_filtered_out() && has_range_tombstones {
+                self.filter.force_positive();
+            }
 
             if self.is_filtered_out() {
                 return Ok(());

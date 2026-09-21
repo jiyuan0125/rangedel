@@ -300,6 +300,27 @@ pub trait DbWriteOps {
         options: &WriteOptions,
     ) -> Result<WriteHandle, crate::Error>;
 
+    /// Delete every key in a range with default `WriteOptions`.
+    ///
+    /// The range bounds use the same inclusive/exclusive expressions as
+    /// `scan`.
+    async fn delete_range<T>(&self, range: T) -> Result<WriteHandle, crate::Error>
+    where
+        T: ByteRangeBounds + Send,
+    {
+        self.delete_range_with_options(range, &WriteOptions::default())
+            .await
+    }
+
+    /// Delete every key in a range with custom `WriteOptions`.
+    async fn delete_range_with_options<T>(
+        &self,
+        range: T,
+        options: &WriteOptions,
+    ) -> Result<WriteHandle, crate::Error>
+    where
+        T: ByteRangeBounds + Send;
+
     /// Merge a value into the database with default `MergeOptions` and
     /// `WriteOptions`.
     ///
